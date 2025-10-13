@@ -121,6 +121,26 @@ class CameraFormatOptions(list):
         """
         return max(self, key=key)
 
+    def find_highest_resolution(formats: List[CameraFormat]) -> CameraFormat:
+        """
+        Pick the format with the highest resolution.
+        If multiple formats have the same resolution, pick the one with the highest framerate.
+        """
+        return max(
+            formats,
+            key=lambda f: (f.width, f.height, f.frame_rate)
+        )
+
+    def find_highest_framerate(formats: List[CameraFormat]) -> CameraFormat:
+        """
+        Pick the format with the highest framerate.
+        If multiple formats have the same framerate, pick the one with the highest resolution.
+        """
+        return max(
+            formats,
+            key=lambda f: (f.frame_rate, f.width, f.height)
+        )
+
     def resolve_default(self) -> CameraFormat:
         """
         Like resolve, but applies some default preferences.
@@ -132,18 +152,26 @@ class CameraFormatOptions(list):
 class CameraControl:
     def __init__(self, control):
         self._control = control
-    
+
+    def __str__(self):
+        return f"{self.value_range} : {self.is_active}"
+
     @property
     def value_range(self) -> range:
         """
         Return a range of values that can be passed to set_value.
         """
         start, stop, step = self._control.value_range()
-        # Just in case - ensure that start is divisible by step, as required by nokhwa
-        new_start = start//step*step
-        while new_start <= start:
-            new_start += step
-        return range(start, stop, step)
+        if step > 0:
+            return range(start, stop, step)
+        return range(start, stop)
+
+    @property
+    def is_active(self) -> bool:
+        return self._control.is_active()
+
+    def set_active(self, value: bool):
+        self._control.set_active(value)
 
     def set_value(self, value: Union[int, None]):
         """
@@ -218,6 +246,11 @@ class Camera:
         if frame is None:
             return None
         w, h, data = frame
+
+        expected_size = w * h * 3
+        if len(data) > expected_size:
+            data = data[:expected_size]
+
         shape = (h, w, 3)
         arr = np.frombuffer(data, dtype=np.uint8)
         return arr.reshape(shape)

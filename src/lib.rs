@@ -11,6 +11,7 @@ use nokhwa::{
         RequestedFormat, RequestedFormatType,
     },
 };
+use nokhwa::utils::Resolution;
 use parking_lot::FairMutex;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -20,10 +21,17 @@ use pyo3::{
 
 #[pyfunction]
 pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
+    println!("[omni_camera] query() called — using Nokhwa backend");
+
     let devices = match nokhwa::query(ApiBackend::Auto) {
         Ok(val) => val,
         Err(error) => return Err(PyRuntimeError::new_err(error.to_string())),
     };
+
+    for d in &devices {
+        println!("{:?}", d);
+    }
+
     let mut result = Vec::with_capacity(devices.len());
     for device in devices.into_iter() {
         if let CameraIndex::Index(index) = *device.index() {
@@ -40,15 +48,36 @@ pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
 
 #[pyfunction]
 pub fn check_can_use(index: u32) -> PyResult<bool> {
-    Ok(nokhwa::Camera::new(
-        CameraIndex::Index(index),
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
-    )
-    .is_ok())
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
+    use std::panic;
+
+    println!("[omni_camera] check_can_use({}) called", index);
+
+    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+
+    let result = panic::catch_unwind(|| {
+        nokhwa::Camera::new(CameraIndex::Index(index), format)
+    });
+
+    match result {
+        Ok(Ok(_)) => {
+            println!("[omni_camera] Camera {} opened successfully", index);
+            Ok(true)
+        }
+        Ok(Err(err)) => {
+            println!("[omni_camera] Failed to open camera {}: {:?}", index, err);
+            Ok(false)
+        }
+        Err(_) => {
+            println!("[omni_camera] Panic while opening camera {}!", index);
+            Ok(false) // return False instead of crashing Python
+        }
+    }
 }
 
 #[pymodule]
-fn omni_camera(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn omni_camera<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
     nokhwa::nokhwa_initialize(|_| {});
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(check_can_use, m)?)?;
@@ -93,7 +122,12 @@ impl CameraInternal {
             mem::drop(cam_guard);
             while active.load(atomic::Ordering::Relaxed) {
                 if let Ok(frame) = camera.lock().frame() {
-                    *last_frame.lock() = Arc::new(frame.decode_image::<RgbFormat>().ok());
+                    *last_frame.lock() = Arc::new(frame.decode_image::<RgbFormat>().ok().map(|img| {
+                        // Convert the ImageBuffer from nokhwa's image crate to our Image type
+                        let (width, height) = (img.width(), img.height());
+                        let raw_pixels = img.into_raw();
+                        ImageBuffer::from_raw(width, height, raw_pixels).unwrap()
+                    }));
                 }
             }
         });
@@ -132,6 +166,7 @@ impl CamFormat {
             FrameFormat::GRAY => "gray".to_string(),
             FrameFormat::NV12 => "nv12".to_string(),
             FrameFormat::RAWRGB => "rawrgb".to_string(),
+            FrameFormat::RAWBGR => "rawbgr".to_string(),
         }
     }
     //#[setter]
@@ -139,6 +174,10 @@ impl CamFormat {
         self.format = match fmt.as_str() {
             "mjpeg" => FrameFormat::MJPEG,
             "yuyv" => FrameFormat::YUYV,
+            "NV12" => FrameFormat::NV12,
+            "rawrgb" => FrameFormat::RAWRGB,
+            "rawbgr" => FrameFormat::RAWBGR,
+
             _ => {
                 return Err(PyValueError::new_err(
                     "Unsupported value (should be one of 'mjpeg', 'yuyv')",
@@ -178,11 +217,67 @@ impl CamControl {
         let control = self.control.lock().unwrap();
         let control_desc = control.description();
         match control_desc {
-            ControlValueDescription::IntegerRange { min, max, step, .. } => (*min, *max, *step),
-            _ => todo!(),
+            ControlValueDescription::None => (0, 0, 0),
+
+            ControlValueDescription::Integer { value, step, .. } => {
+                // Single integer — return value as both min and max
+                (*value, *value, *step)
+            }
+
+            ControlValueDescription::IntegerRange { min, max, step, .. } => {
+                (*min, *max, *step)
+            }
+
+            ControlValueDescription::Float { value, step, .. } => {
+                // Convert to i64 with rounding
+                (*value as i64, *value as i64, *step as i64)
+            }
+
+            ControlValueDescription::FloatRange { min, max, step, .. } => {
+                (*min as i64, *max as i64, *step as i64)
+            }
+
+            ControlValueDescription::Boolean { .. } => {
+                // Boolean is always 0..1
+                (0, 1, 1)
+            }
+
+            ControlValueDescription::String { .. } => {
+                // No numeric range — fallback to 0,0,0
+                (0, 0, 0)
+            }
+
+            ControlValueDescription::Bytes { value, .. } => {
+                // Use length as a proxy range
+                let len = value.len() as i64;
+                (0, len, 1)
+            }
+
+            ControlValueDescription::KeyValuePair { key, value, .. } => {
+                // Just return key/value as min/max
+                (*key as i64, *value as i64, 1)
+            }
+
+            ControlValueDescription::Point { value, .. } => {
+                // Use x as min, y as max (arbitrary but consistent)
+                (value.0 as i64, value.1 as i64, 1)
+            }
+
+            ControlValueDescription::Enum { possible, .. } => {
+                // Enumerations: 0..(N-1)
+                if possible.is_empty() {
+                    (0, 0, 1)
+                } else {
+                    (0, possible.len() as i64 - 1, 1)
+                }
+            }
+
+            ControlValueDescription::RGB { max, .. } => {
+                // Use max R as min and max G as max (arbitrary, but consistent)
+                (0, max.0 as i64, 1)
+            }
         }
     }
-    #[pyo3(signature = (value=None))]
     fn set_value(&self, value: Option<i64>) -> PyResult<()> {
         let mut control = self.control.lock().unwrap();
         match self.cam.upgrade() {
@@ -208,6 +303,15 @@ impl CamControl {
             )),
         }
     }
+
+    fn is_active(&self) -> bool {
+        self.control.lock().unwrap().active()
+    }
+    fn set_active(&self, active: bool) -> PyResult<()> {
+        self.control.lock().unwrap().set_active(active);
+        Ok(())
+    }
+
 }
 
 #[pyclass]
@@ -257,7 +361,7 @@ impl Camera {
             Some(frame) => Ok(Some((
                 frame.width(),
                 frame.height(),
-                PyBytes::new(py, frame).into(),
+                PyBytes::new_bound(py, frame).into(),
             ))),
             None => Ok(None),
         }
@@ -287,5 +391,57 @@ impl Camera {
                 Ok(Vec::new()) // Nothing supported
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use nokhwa::{query, pixel_format::RgbFormat, utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType}};
+    use nokhwa::Camera;
+
+    #[test]
+    fn test_query_cameras() {
+        let devices = query(ApiBackend::Auto)
+            .expect("Failed to query cameras");
+        println!("Found {} devices", devices.len());
+        for d in &devices {
+            println!("{:?}", d);
+        }
+
+        // not necessarily non-zero, but should not crash
+        assert!(devices.len() >= 0);
+    }
+
+    #[test]
+    fn test_capture_frame() {
+        use std::fs::File;
+        // Only run if at least one camera is present
+        let mut cam = match Camera::new(
+            CameraIndex::Index(3),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping: no camera available ({})", e);
+                return;
+            }
+        };
+
+        let fmt = cam.compatible_camera_formats();
+        cam.open_stream();
+
+
+        let frame = cam.frame().expect("Failed to get frame");
+        println!(
+            "Captured frame: {} bytes",
+            frame.buffer().len()
+        );
+        assert!(!frame.buffer().is_empty());
+
+        let mut file = File::create("frame.raw").expect("Failed to create output file");
+        file.write_all(frame.buffer()).expect("Failed to write frame data");
+        println!("Frame bytes written to frame.raw");
     }
 }
