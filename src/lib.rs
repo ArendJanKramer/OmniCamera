@@ -90,7 +90,7 @@ fn omni_camera<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
 type Image = ImageBuffer<Rgb<u8>, Vec<u8>>;
 
 struct CameraInternal {
-    camera: Arc<FairMutex<nokhwa::Camera>>,
+    camera: Arc<FairMutex<Option<nokhwa::Camera>>>,
     active: Arc<atomic::AtomicBool>,
     last_frame: Arc<FairMutex<Arc<Option<Image>>>>,
     last_err: Arc<FairMutex<Option<nokhwa::NokhwaError>>>,
@@ -99,7 +99,7 @@ struct CameraInternal {
 impl CameraInternal {
     fn new(cam: nokhwa::Camera) -> CameraInternal {
         CameraInternal {
-            camera: Arc::new(FairMutex::new(cam)),
+            camera: Arc::new(FairMutex::new(Some(cam))),
             active: Arc::new(atomic::AtomicBool::new(true)),
             last_frame: Arc::new(FairMutex::new(Arc::new(None))),
             last_err: Arc::new(FairMutex::new(None)),
@@ -112,27 +112,81 @@ impl CameraInternal {
         let last_err = Arc::clone(&self.last_err);
         std::thread::spawn(move || {
             let mut cam_guard = camera.lock();
-            if let Err(err) = cam_guard
-                .set_camera_format(format)
-                .and(cam_guard.open_stream())
-            {
-                *last_err.lock() = Some(err);
+            if let Some(ref mut cam) = *cam_guard {
+                if let Err(err) = cam.set_camera_format(format).and(cam.open_stream()) {
+                    *last_err.lock() = Some(err);
+                    return;
+                }
+            } else {
+                println!("[omni_camera] Tried to start, but camera was closed!");
                 return;
             }
+
             mem::drop(cam_guard);
+            let frame_timeout = std::time::Duration::from_secs(5);
+            let mut consecutive_timeouts = 0;
+
             while active.load(atomic::Ordering::Relaxed) {
-                if let Ok(frame) = camera.lock().frame() {
-                    *last_frame.lock() = Arc::new(frame.decode_image::<RgbFormat>().ok().map(|img| {
-                        // Convert the ImageBuffer from nokhwa's image crate to our Image type
-                        let (width, height) = (img.width(), img.height());
-                        let raw_pixels = img.into_raw();
-                        ImageBuffer::from_raw(width, height, raw_pixels).unwrap()
-                    }));
+
+                let maybe_frame = {
+                    eprintln!("[omni_camera] tick before");
+
+                    let mut cam_guard = camera.lock();
+                    eprintln!("[omni_camera] tick after");
+
+                    if let Some(ref mut cam) = *cam_guard {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cam.frame())) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                *last_err.lock() = Some(nokhwa::NokhwaError::GeneralError(
+                                    "Frame capture panic".to_string()
+                                ));
+                                break;
+                            }
+                        }
+                    } else {
+                        eprintln!("[omni_camera] Break at else");
+
+                        break;
+                    }
+                };
+
+                match maybe_frame {
+                    Ok(frame) => {
+                        consecutive_timeouts = 0;
+                        *last_frame.lock() = Arc::new(frame.decode_image::<RgbFormat>().ok().map(|img| {
+                            let (width, height) = (img.width(), img.height());
+                            let raw_pixels = img.into_raw();
+                            ImageBuffer::from_raw(width, height, raw_pixels).unwrap()
+                        }));
+                    }
+                    Err(err) => {
+                        consecutive_timeouts += 1;
+                        if consecutive_timeouts > 3 {
+                            *last_err.lock() = Some(err);
+                            println!("[omni_camera] Stream appears frozen, stopping");
+                            break;
+                        }
+                    }
                 }
             }
         });
         Ok(())
     }
+
+    fn close(&self) {
+        println!("[omni_camera] Closing camera...");
+        self.active.store(false, atomic::Ordering::Relaxed);
+
+        // Drop the camera backend so OS releases the device
+        let mut cam_guard = self.camera.lock();
+        let _ = cam_guard.take(); // `Option::take()` drops the camera
+
+        // Clear state
+        *self.last_frame.lock() = Arc::new(None);
+        *self.last_err.lock() = None;
+    }
+
     fn last_frame(&self) -> Arc<Option<ImageBuffer<Rgb<u8>, Vec<u8>>>> {
         Arc::clone(&self.last_frame.lock())
     }
@@ -207,7 +261,7 @@ impl From<CameraFormat> for CamFormat {
 
 #[pyclass]
 struct CamControl {
-    cam: Weak<FairMutex<nokhwa::Camera>>,
+    cam: Weak<FairMutex<Option<nokhwa::Camera>>>,
     control: Mutex<CameraControl>,
 }
 
@@ -284,8 +338,11 @@ impl CamControl {
             Some(cam) => match value {
                 Some(value) => {
                     control.set_active(true);
-                    let mut cam = cam.lock();
-                    match cam.set_camera_control(
+                    let mut cam_guard = cam.lock();
+                    let camera = cam_guard.as_mut()
+                        .ok_or_else(|| PyRuntimeError::new_err("Camera not initialized"))?;
+
+                    match camera.set_camera_control(
                         control.control(),
                         nokhwa::utils::ControlValueSetter::Integer(value),
                     ) {
@@ -342,15 +399,28 @@ impl Camera {
         Ok(())
     }
 
+    fn close(&self) -> PyResult<()> {
+        self.cam.close();
+        Ok(())
+    }
+
     fn info(&self) -> PyResult<String> {
+        let mut camera = self.cam.camera.lock();
+        let cam = camera.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Camera not initialized"))?;
+
         Ok(format!(
             "Selected format: {:?}",
-            self.cam.camera.lock().camera_format()
+            cam.camera_format()
         ))
     }
 
     fn get_formats(&self) -> PyResult<Vec<CamFormat>> {
-        match self.cam.camera.lock().compatible_camera_formats() {
+        let mut camera = self.cam.camera.lock();
+        let cam = camera.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Camera not initialized"))?;
+
+        match cam.compatible_camera_formats() {
             Ok(formats) => Ok(formats.into_iter().map(|x| x.into()).collect()),
             Err(error) => Err(PyRuntimeError::new_err(error.to_string())),
         }
@@ -374,7 +444,11 @@ impl Camera {
         }
     }
     fn get_controls(&self) -> PyResult<Vec<(String, CamControl)>> {
-        match self.cam.camera.lock().camera_controls_string() {
+        let mut camera = self.cam.camera.lock();
+        let cam = camera.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Camera not initialized"))?;
+
+        match cam.camera_controls_string() {
             Ok(list) => Ok(list
                 .into_iter()
                 .map(|(name, control)| {

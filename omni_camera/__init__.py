@@ -227,6 +227,13 @@ class Camera:
         self._cam.open(fmt._fmt)
         self._initialized = True
 
+    def close(self):
+        """
+        Close the camera
+        """
+        self._cam.close()
+        self._initialized = False
+
     def poll_frame_raw(self) -> Union[tuple[int, int, bytes], None]:
         """
         Get a frame from the camera. Returns width, height, and array of raw rgb values.
