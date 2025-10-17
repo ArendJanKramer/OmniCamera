@@ -129,10 +129,7 @@ impl CameraInternal {
             while active.load(atomic::Ordering::Relaxed) {
 
                 let maybe_frame = {
-                    eprintln!("[omni_camera] tick before");
-
                     let mut cam_guard = camera.lock();
-                    eprintln!("[omni_camera] tick after");
 
                     if let Some(ref mut cam) = *cam_guard {
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cam.frame())) {
@@ -161,6 +158,7 @@ impl CameraInternal {
                         }));
                     }
                     Err(err) => {
+                        eprintln!("Error in decode_image");
                         consecutive_timeouts += 1;
                         if consecutive_timeouts > 3 {
                             *last_err.lock() = Some(err);
@@ -170,7 +168,11 @@ impl CameraInternal {
                     }
                 }
             }
+            println!("[omni_camera] end of while");
+
         });
+        println!("[omni_camera] thread stopped");
+
         Ok(())
     }
 
@@ -472,8 +474,11 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::thread::sleep;
+    use std::time::Duration;
     use nokhwa::{query, pixel_format::RgbFormat, utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType}};
     use nokhwa::Camera;
+    use crate::CameraInternal;
 
     #[test]
     fn test_query_cameras() {
@@ -518,4 +523,159 @@ mod tests {
         file.write_all(frame.buffer()).expect("Failed to write frame data");
         println!("Frame bytes written to frame.raw");
     }
+
+    #[test]
+    fn test_live_view_window() {
+        use nokhwa::{
+            pixel_format::RgbFormat,
+            utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+            Camera,
+        };
+        use minifb::{Key, Window, WindowOptions};
+
+        // Open camera index 0
+        let mut cam = match Camera::new(
+            CameraIndex::Index(0),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping: no camera available ({})", e);
+                return;
+            }
+        };
+
+        cam.open_stream().expect("Failed to open camera stream");
+
+        // Grab one frame to get resolution
+        let frame = cam.frame().expect("Failed to capture initial frame");
+        let decoded = frame.decode_image::<RgbFormat>().expect("Failed to decode frame");
+        let (width, height) = (decoded.width(), decoded.height());
+
+        let mut window = Window::new(
+            "Live Camera View - Press ESC to exit",
+            width as usize,
+            height as usize,
+            WindowOptions::default(),
+        )
+            .expect("Failed to create window");
+
+        println!("Streaming... Press ESC to exit.");
+
+        while window.is_open() && !window.is_key_down(Key::Escape) {
+            let frame = match cam.frame() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Frame error: {}", e);
+                    continue;
+                }
+            };
+
+            let decoded = match frame.decode_image::<RgbFormat>() {
+                Ok(img) => img,
+                Err(e) => {
+                    eprintln!("Decode error: {}", e);
+                    continue;
+                }
+            };
+
+            // Convert RgbImage -> u32 buffer for minifb
+            let mut buffer: Vec<u32> = Vec::with_capacity((width * height) as usize);
+            for pixel in decoded.pixels() {
+                let [r, g, b] = pixel.0;
+                buffer.push(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+            }
+
+            window
+                .update_with_buffer(&buffer, width as usize, height as usize)
+                .expect("Failed to update window");
+        }
+
+        println!("Live view closed.");
+    }
+
+    #[test]
+    fn test_live_view_window_with_wrapper() {
+        use nokhwa::{
+            pixel_format::RgbFormat,
+            utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+            Camera,
+        };
+        use minifb::{Key, Window, WindowOptions};
+        use std::time::Duration;
+
+        // --- 1. Create a nokhwa camera ---
+        let cam = match Camera::new(
+            CameraIndex::Index(0),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping: no camera available ({})", e);
+                return;
+            }
+        };
+
+        // --- 2. Wrap it in your CameraInternal ---
+        let wrapper = CameraInternal::new(cam);
+
+        // --- 3. Start streaming ---
+        let format = wrapper.camera.lock().as_ref().unwrap().camera_format();
+        wrapper.start(format).expect("Failed to start camera");
+
+        // --- 4. Wait briefly to allow first frame to arrive ---
+        std::thread::sleep(Duration::from_millis(200));
+
+        // --- 5. Try to grab an initial frame to size the window ---
+        let mut frame_opt = wrapper.last_frame();
+        let frame = loop {
+            if let Some(ref img) = *frame_opt {
+                break img.clone();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            frame_opt = wrapper.last_frame();
+        };
+
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+
+        let mut window = Window::new(
+            "Live Camera View - Press ESC to exit",
+            width,
+            height,
+            WindowOptions::default(),
+        )
+            .expect("Failed to create window");
+
+
+
+        println!("Streaming from CameraInternal... Press ESC to exit.");
+
+        // --- 6. Live display loop ---
+        while window.is_open() && !window.is_key_down(Key::Escape) {
+            let latest_frame = wrapper.last_frame();
+            if let Some(ref img) = *latest_frame {
+                // Convert ImageBuffer<Rgb<u8>> into a u32 buffer for minifb
+                let mut buffer: Vec<u32> = Vec::with_capacity(width * height);
+                for pixel in img.pixels() {
+                    let [r, g, b] = pixel.0;
+                    buffer.push(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                }
+
+                if let Err(e) = window.update_with_buffer(&buffer, width, height) {
+                    eprintln!("Failed to update window: {}", e);
+                    break;
+                }
+            } else {
+                println!("No frame yet...");
+            }
+
+            std::thread::sleep(Duration::from_millis(30)); // ~30 FPS
+        }
+
+        // --- 7. Shutdown ---
+        println!("Shutting down...");
+        wrapper.close();
+    }
+
 }
