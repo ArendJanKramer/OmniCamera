@@ -19,6 +19,11 @@ use pyo3::{
     types::PyBytes,
 };
 
+use std::collections::HashMap;
+use once_cell::sync::Lazy;
+
+static CAMERA_REGISTRY: Lazy<Mutex<HashMap<u32, Weak<CameraInternal>>>> =    Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[pyfunction]
 pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
     println!("[omni_camera] query() called — using Nokhwa backend");
@@ -28,11 +33,12 @@ pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
         Err(error) => return Err(PyRuntimeError::new_err(error.to_string())),
     };
 
-    for d in &devices {
-        println!("{:?}", d);
-    }
+    let mut result = Vec::new();
 
-    let mut result = Vec::with_capacity(devices.len());
+    // Map by index for quick lookup
+    let mut seen_indices = std::collections::HashSet::new();
+
+    // Add devices normally found by nokhwa
     for device in devices.into_iter() {
         if let CameraIndex::Index(index) = *device.index() {
             result.push((
@@ -41,8 +47,27 @@ pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
                 device.description().to_owned(),
                 device.misc(),
             ));
+            seen_indices.insert(index);
         }
     }
+
+    // Add any registered (opened) cameras not seen
+    let reg = CAMERA_REGISTRY.lock().unwrap();
+    for (&index, weak) in reg.iter() {
+        if seen_indices.contains(&index) {
+            continue;
+        }
+        if weak.upgrade().is_some() {
+            // Fabricate minimal info
+            result.push((
+                index,
+                format!("(open) Camera {}", index),
+                "Already opened by omni_camera".to_string(),
+                String::new(),
+            ));
+        }
+    }
+
     Ok(result)
 }
 
@@ -62,15 +87,15 @@ pub fn check_can_use(index: u32) -> PyResult<bool> {
 
     match result {
         Ok(Ok(_)) => {
-            println!("[omni_camera] Camera {} opened successfully", index);
+            println!("\t[omni_camera] Camera {} opened successfully", index);
             Ok(true)
         }
         Ok(Err(err)) => {
-            println!("[omni_camera] Failed to open camera {}: {:?}", index, err);
+            println!("\t[omni_camera] Failed to open camera {}: {:?}", index, err);
             Ok(false)
         }
         Err(_) => {
-            println!("[omni_camera] Panic while opening camera {}!", index);
+            println!("\t[omni_camera] Panic while opening camera {}!", index);
             Ok(false) // return False instead of crashing Python
         }
     }
@@ -89,6 +114,7 @@ fn omni_camera<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
 
 type Image = ImageBuffer<Rgb<u8>, Vec<u8>>;
 
+#[derive(Clone)]
 struct CameraInternal {
     camera: Arc<FairMutex<Option<nokhwa::Camera>>>,
     active: Arc<atomic::AtomicBool>,
@@ -375,27 +401,48 @@ impl CamControl {
 
 #[pyclass]
 struct Camera {
-    cam: CameraInternal,
+    cam: Arc<CameraInternal>
 }
 
 #[pymethods]
 impl Camera {
     #[new]
     fn new(index: u32) -> PyResult<Camera> {
-        match nokhwa::Camera::new(
+        // Step 1: Check registry for existing
+        {
+            let mut reg = CAMERA_REGISTRY.lock().unwrap();
+            if let Some(existing_weak) = reg.get(&index) {
+                if let Some(existing_cam) = existing_weak.upgrade() {
+                    println!("[omni_camera] Reusing existing CameraInternal for index {}", index);
+                    return Ok(Camera { cam: existing_cam });
+                }
+            }
+        }
+
+        // Step 2: Create new nokhwa camera
+        let raw_cam = match nokhwa::Camera::new(
             CameraIndex::Index(index),
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
         ) {
-            Ok(cam) => Ok(Camera {
-                cam: CameraInternal::new(cam),
-            }),
-            Err(error) => Err(PyRuntimeError::new_err(error.to_string())),
+            Ok(c) => c,
+            Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+        };
+
+        // Step 3: Wrap in Arc and register Weak
+        let internal = Arc::new(CameraInternal::new(raw_cam));
+        {
+            let mut reg = CAMERA_REGISTRY.lock().unwrap();
+            reg.insert(index, Arc::downgrade(&internal));
         }
+
+        Ok(Camera { cam: internal })
     }
+
     fn open(&self, format: CamFormat) -> PyResult<()> {
         if let Err(error) = self.cam.start(format.into()) {
             return Err(PyRuntimeError::new_err(error.to_string()));
         }
+        // Todo
         let has_captured = Arc::new(atomic::AtomicBool::new(false));
         let _has_captured_clone = Arc::clone(&has_captured);
         Ok(())
