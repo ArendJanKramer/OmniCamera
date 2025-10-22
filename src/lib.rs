@@ -1,7 +1,4 @@
-use std::{
-    mem,
-    sync::{atomic, Arc, Mutex, Weak},
-};
+use std::sync::{atomic, Arc, Mutex, Weak};
 
 use image::{ImageBuffer, Rgb};
 use nokhwa::{
@@ -11,7 +8,6 @@ use nokhwa::{
         RequestedFormat, RequestedFormatType,
     },
 };
-use nokhwa::utils::Resolution;
 use parking_lot::FairMutex;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -19,8 +15,8 @@ use pyo3::{
     types::PyBytes,
 };
 
-use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 static CAMERA_REGISTRY: Lazy<Mutex<HashMap<u32, Weak<CameraInternal>>>> =    Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -74,7 +70,7 @@ pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
 #[pyfunction]
 pub fn check_can_use(index: u32) -> PyResult<bool> {
     use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
     use std::panic;
 
     // println!("[omni_camera] check_can_use({}) called", index);
@@ -466,7 +462,7 @@ impl Camera {
     fn new(index: u32) -> PyResult<Camera> {
         // Step 1: Check registry for existing
         {
-            let mut reg = CAMERA_REGISTRY.lock().unwrap();
+            let reg = CAMERA_REGISTRY.lock().unwrap();
             if let Some(existing_weak) = reg.get(&index) {
                 if let Some(existing_cam) = existing_weak.upgrade() {
                     println!("[omni_camera] Reusing existing CameraInternal for index {}", index);
@@ -574,12 +570,10 @@ impl Camera {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::thread::sleep;
-    use std::time::Duration;
-    use nokhwa::{query, pixel_format::RgbFormat, utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType}};
-    use nokhwa::Camera;
     use crate::CameraInternal;
+    use nokhwa::Camera;
+    use nokhwa::{pixel_format::RgbFormat, query, utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType}};
+    use std::io::Write;
 
     #[test]
     fn test_query_cameras() {
@@ -609,7 +603,7 @@ mod tests {
             }
         };
 
-        let fmt = cam.compatible_camera_formats();
+        // let fmt = cam.compatible_camera_formats();
         cam.open_stream();
 
 
