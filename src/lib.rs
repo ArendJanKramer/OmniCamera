@@ -77,25 +77,27 @@ pub fn check_can_use(index: u32) -> PyResult<bool> {
     use nokhwa::utils::{CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
     use std::panic;
 
-    println!("[omni_camera] check_can_use({}) called", index);
+    // println!("[omni_camera] check_can_use({}) called", index);
 
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
 
     let result = panic::catch_unwind(|| {
-        nokhwa::Camera::new(CameraIndex::Index(index), format)
+        let cam = nokhwa::Camera::new(CameraIndex::Index(index), format)?;
+        drop(cam);
+        Ok::<_, nokhwa::NokhwaError>(())
     });
 
     match result {
         Ok(Ok(_)) => {
-            println!("\t[omni_camera] Camera {} opened successfully", index);
+            // println!("\t[omni_camera] Camera {} opened successfully", index);
             Ok(true)
         }
         Ok(Err(err)) => {
-            println!("\t[omni_camera] Failed to open camera {}: {:?}", index, err);
+            // println!("\t[omni_camera] Failed to open camera {}: {:?}", index, err);
             Ok(false)
         }
         Err(_) => {
-            println!("\t[omni_camera] Panic while opening camera {}!", index);
+            // println!("\t[omni_camera] Panic while opening camera {}!", index);
             Ok(false) // return False instead of crashing Python
         }
     }
@@ -117,115 +119,168 @@ type Image = ImageBuffer<Rgb<u8>, Vec<u8>>;
 #[derive(Clone)]
 struct CameraInternal {
     camera: Arc<FairMutex<Option<nokhwa::Camera>>>,
-    active: Arc<atomic::AtomicBool>,
+    active_count: Arc<atomic::AtomicUsize>,
+    running: Arc<atomic::AtomicBool>,                // NEW
+    worker: Arc<FairMutex<Option<std::thread::JoinHandle<()>>>>, // NEW
     last_frame: Arc<FairMutex<Arc<Option<Image>>>>,
     last_err: Arc<FairMutex<Option<nokhwa::NokhwaError>>>,
 }
-
 impl CameraInternal {
     fn new(cam: nokhwa::Camera) -> CameraInternal {
         CameraInternal {
             camera: Arc::new(FairMutex::new(Some(cam))),
-            active: Arc::new(atomic::AtomicBool::new(true)),
+            active_count: Arc::new(atomic::AtomicUsize::new(0)),
+            running: Arc::new(atomic::AtomicBool::new(false)),      // NEW
+            worker: Arc::new(FairMutex::new(None)),                  // NEW
             last_frame: Arc::new(FairMutex::new(Arc::new(None))),
             last_err: Arc::new(FairMutex::new(None)),
         }
     }
+
     fn start(&self, format: CameraFormat) -> Result<(), nokhwa::NokhwaError> {
-        let active = Arc::clone(&self.active);
-        let last_frame = Arc::clone(&self.last_frame);
-        let camera = Arc::clone(&self.camera);
-        let last_err = Arc::clone(&self.last_err);
-        std::thread::spawn(move || {
-            let mut cam_guard = camera.lock();
-            if let Some(ref mut cam) = *cam_guard {
-                if let Err(err) = cam.set_camera_format(format).and(cam.open_stream()) {
-                    *last_err.lock() = Some(err);
-                    return;
-                }
-            } else {
-                println!("[omni_camera] Tried to start, but camera was closed!");
-                return;
-            }
+        // bump user count first
+        self.active_count.fetch_add(1, atomic::Ordering::SeqCst);
 
-            mem::drop(cam_guard);
-            let frame_timeout = std::time::Duration::from_secs(5);
-            let mut consecutive_timeouts = 0;
+        // only start the worker if not already running
+        if self.running.swap(true, atomic::Ordering::SeqCst) == false {
+            let active_count = Arc::clone(&self.active_count);
+            let last_frame = Arc::clone(&self.last_frame);
+            let last_err = Arc::clone(&self.last_err);
+            let running = Arc::clone(&self.running);
+            let camera = Arc::clone(&self.camera);
 
-            while active.load(atomic::Ordering::Relaxed) {
-
-                let maybe_frame = {
+            let handle = std::thread::spawn(move || {
+                // Configure + open on the worker thread
+                {
                     let mut cam_guard = camera.lock();
-
                     if let Some(ref mut cam) = *cam_guard {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cam.frame())) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                *last_err.lock() = Some(nokhwa::NokhwaError::GeneralError(
-                                    "Frame capture panic".to_string()
-                                ));
+                        if let Err(err) = cam.set_camera_format(format).and(cam.open_stream()) {
+                            *last_err.lock() = Some(err);
+                            running.store(false, atomic::Ordering::SeqCst);
+                            return;
+                        }
+                    } else {
+                        eprintln!("[omni_camera] Tried to start, but camera was closed!");
+                        running.store(false, atomic::Ordering::SeqCst);
+                        return;
+                    }
+                }
+
+                let mut consecutive_timeouts = 0;
+                while running.load(atomic::Ordering::Relaxed)
+                    && active_count.load(atomic::Ordering::Relaxed) > 0
+                {
+                    let maybe_frame = {
+                        let mut cam_guard = camera.lock();
+                        if let Some(ref mut cam) = *cam_guard {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cam.frame()))
+                                .unwrap_or_else(|_| Err(nokhwa::NokhwaError::GeneralError("Frame capture panic".into())))
+                        } else {
+                            break;
+                        }
+                    };
+
+                    match maybe_frame {
+                        Ok(frame) => {
+                            consecutive_timeouts = 0;
+                            if let Ok(img) = frame.decode_image::<RgbFormat>() {
+                                let (w, h) = (img.width(), img.height());
+                                let raw = img.into_raw();
+                                if let Some(buf) = ImageBuffer::from_raw(w, h, raw) {
+                                    *last_frame.lock() = Arc::new(Some(buf));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            consecutive_timeouts += 1;
+                            if consecutive_timeouts > 3 {
+                                *last_err.lock() = Some(err);
                                 break;
                             }
                         }
-                    } else {
-                        eprintln!("[omni_camera] Break at else");
-
-                        break;
-                    }
-                };
-
-                match maybe_frame {
-                    Ok(frame) => {
-                        consecutive_timeouts = 0;
-                        *last_frame.lock() = Arc::new(frame.decode_image::<RgbFormat>().ok().map(|img| {
-                            let (width, height) = (img.width(), img.height());
-                            let raw_pixels = img.into_raw();
-                            ImageBuffer::from_raw(width, height, raw_pixels).unwrap()
-                        }));
-                    }
-                    Err(err) => {
-                        eprintln!("Error in decode_image");
-                        consecutive_timeouts += 1;
-                        if consecutive_timeouts > 3 {
-                            *last_err.lock() = Some(err);
-                            println!("[omni_camera] Stream appears frozen, stopping");
-                            break;
-                        }
                     }
                 }
-            }
-            println!("[omni_camera] end of while");
 
-        });
-        println!("[omni_camera] thread stopped");
+                // Stop stream on the same thread that opened it
+                {
+                    let mut cam_guard = camera.lock();
+                    if let Some(ref mut cam) = *cam_guard {
+                        let _ = cam.stop_stream();
+                    }
+                }
+
+                running.store(false, atomic::Ordering::SeqCst);
+                // done
+            });
+
+            *self.worker.lock() = Some(handle);
+            println!("[omni_camera] worker thread started"); // fixed log
+        }
 
         Ok(())
     }
 
     fn close(&self) {
-        println!("[omni_camera] Closing camera...");
-        self.active.store(false, atomic::Ordering::Relaxed);
+        println!("[omni_camera] Closing camera (conditional)...");
+        let remaining = self.active_count.fetch_sub(1, atomic::Ordering::SeqCst).saturating_sub(1);
+        println!("[omni_camera] Remaining active users = {}", remaining);
 
-        // Drop the camera backend so OS releases the device
-        let mut cam_guard = self.camera.lock();
-        let _ = cam_guard.take(); // `Option::take()` drops the camera
+        if remaining == 0 {
+            println!("[omni_camera] Last active user — requesting worker shutdown.");
+            self.running.store(false, atomic::Ordering::SeqCst);
 
-        // Clear state
-        *self.last_frame.lock() = Arc::new(None);
-        *self.last_err.lock() = None;
+            // Join worker before mutating camera state
+            if let Some(handle) = self.worker.lock().take() {
+                let _ = handle.join();
+                println!("[omni_camera] Worker joined.");
+            }
+
+            // Now it’s safe to clear buffers and release the camera
+            {
+                let mut cam_guard = self.camera.lock();
+                // camera stream already stopped on worker; just drop it
+                let _ = cam_guard.take();
+            }
+            *self.last_frame.lock() = Arc::new(None);
+            *self.last_err.lock() = None;
+
+            let mut reg = CAMERA_REGISTRY.lock().unwrap();
+            reg.retain(|_, weak| weak.upgrade().is_some());
+        } else {
+            println!("[omni_camera] Other users still streaming; keeping worker alive.");
+        }
     }
 
     fn last_frame(&self) -> Arc<Option<ImageBuffer<Rgb<u8>, Vec<u8>>>> {
         Arc::clone(&self.last_frame.lock())
     }
+
 }
 
 impl Drop for CameraInternal {
     fn drop(&mut self) {
-        self.active.store(false, atomic::Ordering::Relaxed);
+        let remaining = self.active_count.load(atomic::Ordering::SeqCst);
+        println!("[omni_camera] Dropping CameraInternal — active users = {}", remaining);
+
+        // Ensure shutdown if someone forgot to call close()
+        self.running.store(false, atomic::Ordering::SeqCst);
+        if let Some(handle) = self.worker.lock().take() {
+            let _ = handle.join();
+        }
+
+        // Best-effort stop & drop
+        if let Some(mut cam) = self.camera.lock().take() {
+            let _ = cam.stop_stream();
+        }
+        *self.last_frame.lock() = Arc::new(None);
+        *self.last_err.lock() = None;
+
+        let mut reg = CAMERA_REGISTRY.lock().unwrap();
+        reg.retain(|_, weak| weak.upgrade().is_some());
+
+        println!("[omni_camera] CameraInternal dropped cleanly.");
     }
 }
-
 #[derive(Clone)]
 #[pyclass]
 struct CamFormat {
@@ -256,7 +311,8 @@ impl CamFormat {
         self.format = match fmt.as_str() {
             "mjpeg" => FrameFormat::MJPEG,
             "yuyv" => FrameFormat::YUYV,
-            "NV12" => FrameFormat::NV12,
+            "gray" => FrameFormat::GRAY,
+            "nv12" => FrameFormat::NV12,
             "rawrgb" => FrameFormat::RAWRGB,
             "rawbgr" => FrameFormat::RAWBGR,
 
@@ -477,15 +533,13 @@ impl Camera {
 
     fn poll_frame(&self, py: Python) -> PyResult<Option<(u32, u32, Py<PyBytes>)>> {
         match &*self.cam.last_frame() {
-            Some(frame) => Ok(Some((
-                frame.width(),
-                frame.height(),
-                PyBytes::new_bound(py, frame).into(),
-            ))),
+            Some(frame) => {
+                let bytes = PyBytes::new_bound(py, frame.as_raw());
+                Ok(Some((frame.width(), frame.height(), bytes.into())))
+            }
             None => Ok(None),
         }
     }
-
     fn check_err(&self) -> PyResult<()> {
         match &*self.cam.last_err.lock() {
             Some(error) => Err(PyRuntimeError::new_err(error.to_string())),
