@@ -47,23 +47,6 @@ pub fn query() -> PyResult<Vec<(u32, String, String, String)>> {
         }
     }
 
-    // Add any registered (opened) cameras not seen
-    let reg = CAMERA_REGISTRY.lock().unwrap();
-    for (&index, weak) in reg.iter() {
-        if seen_indices.contains(&index) {
-            continue;
-        }
-        if weak.upgrade().is_some() {
-            // Fabricate minimal info
-            result.push((
-                index,
-                format!("(open) Camera {}", index),
-                "Already opened by omni_camera".to_string(),
-                String::new(),
-            ));
-        }
-    }
-
     Ok(result)
 }
 
@@ -73,7 +56,14 @@ pub fn check_can_use(index: u32) -> PyResult<bool> {
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
     use std::panic;
 
-    // println!("[omni_camera] check_can_use({}) called", index);
+    {
+        let reg = CAMERA_REGISTRY.lock().unwrap();
+        if let Some(weak) = reg.get(&index) {
+            if weak.upgrade().is_some() {
+                return Ok(true);
+            }
+        }
+    }
 
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
 
