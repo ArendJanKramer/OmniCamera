@@ -17,6 +17,7 @@ use pyo3::{
 
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 static CAMERA_REGISTRY: Lazy<Mutex<HashMap<u32, Weak<CameraInternal>>>> =    Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -201,6 +202,39 @@ impl CameraInternal {
 
             *self.worker.lock() = Some(handle);
             println!("[omni_camera] worker thread started"); // fixed log
+        } else {
+            // Check if the requested format matches the current camera format that is already streaming.
+            let (have_cam, matches, current_fmt_opt) = {
+                let guard = self.camera.lock();
+                match *guard {
+                    Some(ref cam) => {
+                        let current = cam.camera_format(); // nokhwa returns by value
+                        let eq = current == format;
+                        (true, eq, Some(current))
+                    }
+                    None => (false, false, None),
+                }
+            };
+
+            if !have_cam {
+                // No camera while `running == true` is an inconsistent state.
+                self.active_count.fetch_sub(1, Ordering::SeqCst);
+                return Err(nokhwa::NokhwaError::GeneralError(
+                    "Camera is not available while marked as running".into(),
+                ));
+            }
+
+            if !matches {
+                self.active_count.fetch_sub(1, Ordering::SeqCst);
+                let current_dbg = current_fmt_opt
+                    .map(|f| format!("{:?}x{:?}@{:?}", f.width(), f.height(), f.frame_rate()))
+                    .unwrap_or_else(|| "<unknown>".into());
+                let requested_fmt = format!("{:?}x{:?}@{:?}", format.width(), format.height(), format.frame_rate());
+                return Err(nokhwa::NokhwaError::GeneralError(format!(
+                    "Camera is already streaming with a different format. Current: {}, Requested: {}",
+                    current_dbg, requested_fmt
+                )));
+            }
         }
 
         Ok(())
