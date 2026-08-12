@@ -315,6 +315,24 @@ struct CamFormat {
 
 #[pymethods]
 impl CamFormat {
+    /// Construct a `CamFormat` directly, e.g. to request a resolution that wasn't
+    /// surfaced by `Camera.get_formats()` (some v4l2 sensors report a stepwise
+    /// resolution range rather than a fixed list; the driver will accept/clamp
+    /// whatever is actually valid when the format is set).
+    #[new]
+    fn new(width: u32, height: u32, frame_rate: u32, format: String) -> PyResult<Self> {
+        // Default value is overwritten by set_format below; only used to satisfy
+        // the struct literal before validating `format`.
+        let mut cam_format = CamFormat {
+            width,
+            height,
+            frame_rate,
+            format: FrameFormat::MJPEG,
+        };
+        cam_format.set_format(format)?;
+        Ok(cam_format)
+    }
+
     #[getter]
     fn get_format(&self) -> String {
         match self.format {
@@ -324,6 +342,8 @@ impl CamFormat {
             FrameFormat::NV12 => "nv12".to_string(),
             FrameFormat::RAWRGB => "rawrgb".to_string(),
             FrameFormat::RAWBGR => "rawbgr".to_string(),
+            FrameFormat::BA10 => "ba10".to_string(),
+            FrameFormat::BA12 => "ba12".to_string(),
         }
     }
     //#[setter]
@@ -335,10 +355,14 @@ impl CamFormat {
             "nv12" => FrameFormat::NV12,
             "rawrgb" => FrameFormat::RAWRGB,
             "rawbgr" => FrameFormat::RAWBGR,
+            // Raw 10-/12-bit Bayer GRBG straight off a v4l2 sensor (V4L2_PIX_FMT_SGRBG10/12,
+            // fourcc "BA10"/"BA12"), demosaiced to RGB888 on decode.
+            "ba10" => FrameFormat::BA10,
+            "ba12" => FrameFormat::BA12,
 
             _ => {
                 return Err(PyValueError::new_err(
-                    "Unsupported value (should be one of 'mjpeg', 'yuyv')",
+                    "Unsupported value (should be one of 'mjpeg', 'yuyv', 'gray', 'nv12', 'rawrgb', 'rawbgr', 'ba10', 'ba12')",
                 ))
             }
         };
@@ -594,22 +618,46 @@ impl Camera {
 
 #[cfg(test)]
 mod tests {
-    use crate::CameraInternal;
+    use crate::{check_can_use, CameraInternal};
     use nokhwa::Camera;
     use nokhwa::{pixel_format::RgbFormat, query, utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType}};
     use std::io::Write;
+    use std::panic;
 
     #[test]
-    fn test_query_cameras() {
+    fn test_query_cameras() -> Result<(), Box<dyn std::error::Error>> {
         let devices = query(ApiBackend::Auto)
             .expect("Failed to query cameras");
         println!("Found {} devices", devices.len());
         for d in &devices {
-            println!("{:?}", d);
+            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+
+            let result = panic::catch_unwind(|| {
+                let cam = nokhwa::Camera::new(CameraIndex::Index(d.index().as_index().unwrap()), format)?;
+                drop(cam);
+                Ok::<_, nokhwa::NokhwaError>(())
+            });
+
+            match result {
+                Ok(Ok(_)) => {
+                    // println!("\t[omni_camera] Camera {} opened successfully", index);
+                    println!("{:?}", d);
+                },
+                Err(_) => {
+                    // println!("{:?} not openable", d);
+                },
+                Ok(Err(_)) => {
+                    // println!("{:?} not openable", d);
+                },
+            }
+
+
+
         }
 
         // not necessarily non-zero, but should not crash
         assert!(devices.len() >= 0);
+        Ok(())
     }
 
     #[test]
@@ -617,7 +665,7 @@ mod tests {
         use std::fs::File;
         // Only run if at least one camera is present
         let mut cam = match Camera::new(
-            CameraIndex::Index(3),
+            CameraIndex::Index(32),
             RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
         ) {
             Ok(c) => c,
@@ -647,15 +695,19 @@ mod tests {
     fn test_live_view_window() {
         use nokhwa::{
             pixel_format::RgbFormat,
-            utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+            utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType},
             Camera,
         };
         use minifb::{Key, Window, WindowOptions};
 
+        // Hardcoded for debugging: 1280x960 @ 30fps, raw 10-bit Bayer GRBG (BA10).
+        let requested_fmt = CameraFormat::new_from(1280, 960, FrameFormat::BA10, 30);
+        println!("Requesting {:?}", requested_fmt);
+
         // Open camera index 0
         let mut cam = match Camera::new(
-            CameraIndex::Index(0),
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
+            CameraIndex::Index(32),
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(requested_fmt)),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -665,9 +717,20 @@ mod tests {
         };
 
         cam.open_stream().expect("Failed to open camera stream");
+        println!("Camera opened with format: {:?}", cam.camera_format());
 
         // Grab one frame to get resolution
         let frame = cam.frame().expect("Failed to capture initial frame");
+        let res = frame.resolution();
+        println!(
+            "Raw frame: {} bytes for {}x{} (source format {:?}); expected tightly-packed size = {} bytes ({} bytes/row if unpadded)",
+            frame.buffer().len(),
+            res.width(),
+            res.height(),
+            frame.source_frame_format(),
+            (res.width() * res.height() * 2) as usize,
+            res.width() as usize * 2,
+        );
         let decoded = frame.decode_image::<RgbFormat>().expect("Failed to decode frame");
         let (width, height) = (decoded.width(), decoded.height());
 

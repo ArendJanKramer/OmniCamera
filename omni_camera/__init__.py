@@ -37,12 +37,39 @@ class FrameFormat(Enum):
     GRAY = "gray"
     NV12 = "nv12"
     RAWRGB = "rawrgb"
+    BA10 = "ba10"
+    BA12 = "ba12"
 
 
 class CameraFormat:
-    def __init__(self, cam_format: omni_camera.CamFormat):
-        self._fmt = cam_format
-    
+    def __init__(
+        self,
+        cam_format: omni_camera.CamFormat = None,
+        *,
+        width: int = None,
+        height: int = None,
+        frame_rate: int = None,
+        frame_format: FrameFormat = None,
+    ):
+        """
+        Wraps an existing native CamFormat, or builds a new one from scratch:
+
+            CameraFormat(width=4080, height=4095, frame_rate=30, frame_format=FrameFormat.BA10)
+
+        Building one directly is useful for resolutions a camera's driver reports
+        as a stepwise/continuous range (e.g. some v4l2 raw Bayer sensors) rather
+        than a fixed list, since those won't show up in `get_format_options()`.
+        The driver validates (and may clamp) the request when the camera is opened.
+        """
+        if cam_format is not None:
+            self._fmt = cam_format
+            return
+        if None in (width, height, frame_rate, frame_format):
+            raise ValueError(
+                "Must provide either cam_format, or all of width, height, frame_rate, and frame_format"
+            )
+        self._fmt = omni_camera.CamFormat(width, height, frame_rate, frame_format.value)
+
     @property
     def width(self) -> int:
         return self._fmt.width
