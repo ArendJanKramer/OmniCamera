@@ -722,7 +722,7 @@ dependencies = [
 [[package]]
 name = "nokhwa"
 version = "0.10.9"
-source = "git+https://github.com/arendjankramer/nokhwa.git?rev=da6646027fc9c915cdb38149df77dba8239b055f#da6646027fc9c915cdb38149df77dba8239b055f"
+source = "git+https://github.com/arendjankramer/nokhwa.git?rev=04ec93b57196d6c66590d401cd4318f67a8d9cce#04ec93b57196d6c66590d401cd4318f67a8d9cce"
 dependencies = [
  "flume",
  "image",
@@ -738,7 +738,7 @@ dependencies = [
 [[package]]
 name = "nokhwa-bindings-linux"
 version = "0.1.2"
-source = "git+https://github.com/arendjankramer/nokhwa.git?rev=da6646027fc9c915cdb38149df77dba8239b055f#da6646027fc9c915cdb38149df77dba8239b055f"
+source = "git+https://github.com/arendjankramer/nokhwa.git?rev=04ec93b57196d6c66590d401cd4318f67a8d9cce#04ec93b57196d6c66590d401cd4318f67a8d9cce"
 dependencies = [
  "nokhwa-core",
  "v4l",
@@ -747,7 +747,7 @@ dependencies = [
 [[package]]
 name = "nokhwa-bindings-macos"
 version = "0.2.3"
-source = "git+https://github.com/arendjankramer/nokhwa.git?rev=da6646027fc9c915cdb38149df77dba8239b055f#da6646027fc9c915cdb38149df77dba8239b055f"
+source = "git+https://github.com/arendjankramer/nokhwa.git?rev=04ec93b57196d6c66590d401cd4318f67a8d9cce#04ec93b57196d6c66590d401cd4318f67a8d9cce"
 dependencies = [
  "block",
  "cocoa-foundation",
@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "nokhwa-bindings-windows"
 version = "0.4.4"
-source = "git+https://github.com/arendjankramer/nokhwa.git?rev=da6646027fc9c915cdb38149df77dba8239b055f#da6646027fc9c915cdb38149df77dba8239b055f"
+source = "git+https://github.com/arendjankramer/nokhwa.git?rev=04ec93b57196d6c66590d401cd4318f67a8d9cce#04ec93b57196d6c66590d401cd4318f67a8d9cce"
 dependencies = [
  "nokhwa-core",
  "once_cell",
@@ -773,7 +773,7 @@ dependencies = [
 [[package]]
 name = "nokhwa-core"
 version = "0.1.7"
-source = "git+https://github.com/arendjankramer/nokhwa.git?rev=da6646027fc9c915cdb38149df77dba8239b055f#da6646027fc9c915cdb38149df77dba8239b055f"
+source = "git+https://github.com/arendjankramer/nokhwa.git?rev=04ec93b57196d6c66590d401cd4318f67a8d9cce#04ec93b57196d6c66590d401cd4318f67a8d9cce"
 dependencies = [
  "bytes",
  "image",
